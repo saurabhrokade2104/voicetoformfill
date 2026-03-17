@@ -1,0 +1,12 @@
+[build]
+  publish = "frontend"
+  functions = "backend"
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/server/:splat"
+  status = 200
+
+[functions]
+  external_node_modules = ["express", "cors", "dotenv", "@google/generative-ai", "serverless-http"]
+  node_bundler = "esbuild"
