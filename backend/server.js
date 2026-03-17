@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const path = require("path");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const serverless = require("serverless-http");
 require("dotenv").config();
@@ -8,6 +9,10 @@ const app = express();
 
 app.use(cors());
 app.use(express.json());
+
+// Serve static files from the frontend directory
+// This is needed for standard deployments like Railway
+app.use(express.static(path.join(__dirname, "../frontend")));
 
 // Initialize Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -95,11 +100,12 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// Export the handler for serverless use
+// Export the handler for serverless use (Netlify)
 module.exports.handler = serverless(app);
 
-// Keep app.listen for local development only
-if (process.env.NODE_ENV !== 'production') {
+// Standard listener for Railway and local development
+// We check if we are NOT running in a serverless environment
+if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
     console.log(`\n🚀 Voice Form AI Server running at http://localhost:${PORT}`);
