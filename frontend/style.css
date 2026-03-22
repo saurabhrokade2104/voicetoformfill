@@ -471,6 +471,14 @@ body {
   animation: btn-pulse 1s ease-in-out infinite;
 }
 
+.mic-btn.ai-talking {
+  background: #334155;
+  box-shadow: none;
+  animation: none;
+  cursor: not-allowed;
+  opacity: 0.8;
+}
+
 @keyframes btn-pulse {
 
   0%,

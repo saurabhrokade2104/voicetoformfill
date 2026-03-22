@@ -1,97 +1,177 @@
 /* ─────────────────────────────────────────────────────────────────────────────
-   Voice Conversational Form Filler — script.js
+   Voice Conversational Form Filler — script.js (Phase 1: WebSocket Real-Time)
    FLOW:
-     1. User clicks mic
-     2. System ASKS for details via speech synthesis
-     3. After speaking, system starts LISTENING for user's reply
-     4. Speech → Backend /extract → OpenAI → JSON → form filled
-     5. System READS BACK the details it filled
-     6. System asks user to review and submit
-     7. User clicks Submit → success modal
+     1. User clicks "Start Voice Assistant".
+     2. Connects to backend WebSocket `/live`.
+     3. Backend natively says Hello via TTS.
+     4. Browser STT listens continuously & sends mapped text to Backend WS.
+     5. Backend LLM checks state & Cartesia streams back audio chunks.
+     6. Frontend plays chunks natively via AudioContext.
+     7. Form visually updates instantly via WS events.
 ───────────────────────────────────────────────────────────────────────────── */
 
-const BACKEND_URL = "/api";
+const WS_URL = `ws://${window.location.host}/live`;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 let recognition = null;
-let isListening = false;
+let isCallActive = false;
 let currentLang = "en-IN";
-let synth = window.speechSynthesis;
-let voices = [];
-let flowStarted = false;
+let ws = null;
+let isAiSpeaking = false;
 
-// All form field IDs
+// Audio context for playing Cartesia streaming audio
+let audioCtx = null;
+let nextPlayTime = 0;
+
 const FIELD_IDS = [
     "name", "email", "phone", "city",
     "college", "degree", "branch", "graduation_year", "cgpa", "skills"
 ];
 
-// ─── Load voices (some browsers load asynchronously) ─────────────────────────
-function loadVoices() {
-    voices = synth.getVoices();
-}
-loadVoices();
-if (speechSynthesis.onvoiceschanged !== undefined) {
-    speechSynthesis.onvoiceschanged = loadVoices;
-}
+// ─── Audio Playback via AudioContext ─────────────────────────────────────────
 
-// ─── Speech Synthesis helper ─────────────────────────────────────────────────
-function speak(text, onDone) {
-    synth.cancel();
-    const utt = new SpeechSynthesisUtterance(text);
-    utt.lang = currentLang === "hi-IN" ? "hi-IN" : "en-IN";
-    utt.rate = 0.92;
-    utt.pitch = 1;
-    utt.volume = 1;
-
-    // Prefer a natural English/Hindi voice if available
-    const preferred = voices.find(v =>
-        v.lang === utt.lang && v.name.toLowerCase().includes("female")
-    ) || voices.find(v => v.lang === utt.lang) || null;
-    if (preferred) utt.voice = preferred;
-
-    if (typeof onDone === "function") utt.onend = onDone;
-    synth.speak(utt);
+function initAudioContext() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    }
+    if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+    }
 }
 
-// ─── Step 1: Start the full voice flow ───────────────────────────────────────
+function playAudioChunk(base64Str) {
+    if (!audioCtx) return;
+
+    // Cartesia sends raw pcm_s16le encoded as base64 in our setup
+    const rawStr = window.atob(base64Str);
+    const len = rawStr.length;
+    const bytes = new Int16Array(len / 2);
+    for (let i = 0; i < len; i += 2) {
+        bytes[i / 2] = rawStr.charCodeAt(i) | (rawStr.charCodeAt(i + 1) << 8);
+        if (bytes[i / 2] > 32767) bytes[i / 2] -= 65536;
+    }
+
+    const buffer = audioCtx.createBuffer(1, bytes.length, 16000);
+    const channelData = buffer.getChannelData(0);
+    for (let i = 0; i < bytes.length; i++) {
+        channelData[i] = bytes[i] / 32768.0;
+    }
+
+    const source = audioCtx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audioCtx.destination);
+
+    if (nextPlayTime < audioCtx.currentTime) {
+        nextPlayTime = audioCtx.currentTime;
+    }
+    source.start(nextPlayTime);
+    nextPlayTime += buffer.duration;
+
+    // Mark AI speaking until the last buffer finishes (+ small buffer)
+    isAiSpeaking = true;
+}
+
+function stopAudio() {
+    if (audioCtx) {
+        audioCtx.close();
+        audioCtx = null;
+    }
+    nextPlayTime = 0;
+}
+
+
+// ─── Live Connection Management ──────────────────────────────────────────────
+
 function handleMicClick() {
-    if (isListening) {
-        stopRecording();
-        return;
-    }
-
-    if (!flowStarted) {
-        startConversationalFlow();
+    if (isCallActive) {
+        endCall();
     } else {
-        startListening();
+        startCall();
     }
 }
 
-function startConversationalFlow() {
-    flowStarted = true;
+function startCall() {
+    initAudioContext();
+    isCallActive = true;
     hideMissing();
     hideTranscript();
-    setStatus("processing", "Preparing to ask you for details…");
+    setStatus("processing", "Connecting to live voice agent...");
+    document.getElementById("micBtn").classList.add("recording");
+    document.getElementById("micLabel").textContent = "End Call";
+    showLoader(true);
 
-    const question =
-        currentLang === "hi-IN"
-            ? "नमस्ते! कृपया मुझे अपना नाम, ईमेल पता, फोन नंबर, शहर, कॉलेज, डिग्री, ब्रांच, स्नातक वर्ष, सी जी पी ए और कौशल बताएं।"
-            : "Hello! Please tell me your full name, email address, phone number, city, college name, degree, branch, graduation year, CGPA, and your key skills. Go ahead and speak after the beep.";
+    ws = new WebSocket(WS_URL);
 
-    setStatus("processing", "Speaking — listen for the question…");
-    playBeepAndAsk(question);
+    ws.onopen = () => {
+        setStatus("listening", "Call Connected. Listening...");
+        showLoader(false);
+        document.getElementById("aiAvatar").classList.add("listening");
+        startListening(); // Start browser STT
+    };
+
+    ws.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            if (data.type === "form_update") {
+                fillForm(data.data);
+                updateProgress();
+                if (data.isConfirmed) {
+                    handleFinalConfirm();
+                } else if (data.textReply) {
+                    showTranscript("Agent: " + data.textReply);
+                }
+            } else if (data.type === "audio_chunk" && data.audioData) {
+                isAiSpeaking = true;
+                setStatus("processing", "AI Speaking...");
+                document.getElementById("micBtn").classList.add("ai-talking");
+                document.getElementById("micLabel").textContent = "AI Speaking...";
+                document.getElementById("aiAvatar").classList.remove("listening");
+                playAudioChunk(data.audioData);
+            } else if (data.type === "audio_end") {
+                // Wait slightly after audio ends before unmuting mic to avoid tail echo
+                setTimeout(() => {
+                    isAiSpeaking = false;
+                    if (isCallActive) {
+                        setStatus("listening", "Call Active. Listening...");
+                        document.getElementById("micBtn").classList.remove("ai-talking");
+                        document.getElementById("micLabel").textContent = "End Call";
+                        document.getElementById("aiAvatar").classList.add("listening");
+                    }
+                }, 1000);
+            }
+        } catch (e) {
+            console.error("WS error:", e);
+        }
+    };
+
+    ws.onclose = () => {
+        endCall();
+    };
+
+    ws.onerror = () => {
+        setStatus("idle", "Connection error. Retry.");
+        endCall();
+    };
 }
 
-function playBeepAndAsk(question) {
-    // Visual cue that system is about to ask
-    document.getElementById("aiAvatar").classList.add("listening");
-    speak(question, () => {
-        // After system finishes asking → start listening
-        document.getElementById("aiAvatar").classList.remove("listening");
-        playBeep();
-        setTimeout(() => startListening(), 300);
-    });
+function endCall() {
+    isCallActive = false;
+    if (ws) {
+        ws.close();
+        ws = null;
+    }
+
+    if (recognition) {
+        try { recognition.stop(); } catch (e) { }
+    }
+
+    stopAudio();
+
+    document.getElementById("micBtn").classList.remove("recording");
+    document.getElementById("micLabel").textContent = "Start Voice Assistant";
+    document.getElementById("aiAvatar").classList.remove("listening");
+    setStatus("idle", "Live call ended. Click to restart.");
+    showLoader(false);
 }
 
 // ─── Step 2: Listen for user's speech ────────────────────────────────────────
@@ -108,96 +188,66 @@ function initRecognition() {
         return null;
     }
     const r = new SR();
-    r.continuous = false;
-    r.interimResults = false;
+    // Continuous listening to mimic real-time call
+    r.continuous = true;
+    r.interimResults = false; // Only send final text segments to LLM
     r.lang = currentLang;
     r.maxAlternatives = 1;
 
-    r.onstart = () => {
-        isListening = true;
-        setStatus("listening", "Listening… speak now 🎤");
-        document.getElementById("micBtn").classList.add("recording");
-        document.getElementById("micLabel").textContent = "Stop Recording";
-        document.getElementById("aiAvatar").classList.add("listening");
-        hideMissing();
-    };
-
     r.onresult = (e) => {
-        const transcript = e.results[0][0].transcript;
-        showTranscript(transcript);
-        processTranscript(transcript);
+        // Find the newly finalized text
+        for (let i = e.resultIndex; i < e.results.length; ++i) {
+            if (e.results[i].isFinal) {
+                const transcript = e.results[i][0].transcript.trim();
+
+                // COMPREHENSIVE ECHO CANCELLATION:
+                // If flag is set OR the audio queue hasn't finished playing yet, ignore.
+                const isPlaybackHappening = (audioCtx && audioCtx.currentTime < nextPlayTime + 0.5);
+
+                if (isAiSpeaking || isPlaybackHappening) {
+                    console.log("🚫 Echo ignored:", transcript);
+                    return;
+                }
+
+                showTranscript("You: " + transcript);
+
+                // Stop any audio playing if user interrupts
+                if (audioCtx && audioCtx.state === 'running') {
+                    // Primitive interruption logic: skip queued audio
+                    // nextPlayTime = audioCtx.currentTime; 
+                }
+
+                // Send to backend via WS
+                if (ws && ws.readyState === WebSocket.OPEN && transcript.length > 0) {
+                    ws.send(JSON.stringify({ type: "text", text: transcript }));
+                    setStatus("processing", "AI Thinking...");
+                    setTimeout(() => setStatus("listening", "Call Active. Listening..."), 1500);
+                }
+            }
+        }
     };
 
     r.onerror = (e) => {
+        // Ignore simple no-speech errors in continuous mode
+        if (e.error === 'no-speech') return;
         console.error("Speech recognition error:", e.error);
-        const msgs = {
-            "no-speech": "No speech detected. Click the mic and try again.",
-            "audio-capture": "Microphone not found. Check your device.",
-            "not-allowed": "Microphone access denied. Please allow mic access.",
-            "network": "Network error. Please try again.",
-        };
-        setStatus("idle", msgs[e.error] || `Error: ${e.error}. Please retry.`);
-        stopRecording();
-        flowStarted = false;
     };
 
-    r.onend = () => { if (isListening) stopRecording(); };
+    r.onend = () => {
+        // Auto-restart if we are still in call
+        if (isCallActive) {
+            try { r.start(); } catch (e) { }
+        }
+    };
 
     return r;
 }
 
-function stopRecording() {
-    isListening = false;
-    if (recognition) { try { recognition.stop(); } catch (_) { } }
-    document.getElementById("micBtn").classList.remove("recording");
-    document.getElementById("micLabel").textContent = "Start Voice Assistant";
-    document.getElementById("aiAvatar").classList.remove("listening");
-}
+// ─── UI Helpers ───────────────────────────────────────────────────────────
 
-// ─── Step 3: Send to Backend → OpenAI → Get JSON ─────────────────────────────
-async function processTranscript(text) {
-    setStatus("processing", "Analysing with AI…");
-    showLoader(true);
-
-    try {
-        const response = await fetch(`${BACKEND_URL}/extract`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ speech_text: text, fields: FIELD_IDS }),
-        });
-
-        const result = await response.json().catch(() => ({}));
-
-        if (!response.ok) {
-            const errorMsg = result.details ? `${result.error} (${result.details})` : (result.error || `HTTP ${response.status}`);
-            throw new Error(errorMsg);
-        }
-
-        if (result.success && result.data) {
-            fillForm(result.data);
-            updateProgress();
-            const missing = getMissingFields(result.data);
-            if (missing.length > 0) {
-                handleMissingFields(missing);
-            } else {
-                readBackDetails(result.data);
-            }
-        } else {
-            throw new Error("Invalid response from server.");
-        }
-    } catch (err) {
-        console.error("Extract error:", err);
-        setStatus("idle", `❌ ${err.message}`);
-        flowStarted = false;
-    } finally {
-        showLoader(false);
-    }
-}
-
-// ─── Step 4a: Fill DOM form fields ───────────────────────────────────────────
 function fillForm(data) {
+    if (!data) return;
     FIELD_IDS.forEach((fieldId) => {
-        if (!(fieldId in data)) return;
         const input = document.getElementById(fieldId);
         const indEl = document.getElementById(`ind-${fieldId}`);
         if (!input) return;
@@ -206,78 +256,22 @@ function fillForm(data) {
         if (Array.isArray(value)) value = value.join(", ");
 
         if (value && String(value).trim() !== "") {
-            input.value = String(value).trim();
-            input.classList.add("filled", "voice-filled");
-            if (indEl) indEl.classList.add("filled");
-            input.addEventListener("animationend", () => input.classList.remove("voice-filled"), { once: true });
+            if (input.value !== String(value).trim()) {
+                input.value = String(value).trim();
+                input.classList.add("filled", "voice-filled");
+                if (indEl) indEl.classList.add("filled");
+                input.addEventListener("animationend", () => input.classList.remove("voice-filled"), { once: true });
+            }
         }
     });
 }
 
-// ─── Step 4b: Read back filled details ───────────────────────────────────────
-function readBackDetails(data) {
-    setStatus("done", "Details filled! Reviewing with you…");
-
-    const parts = [];
-    const labelMap = {
-        name: "Name", email: "Email", phone: "Phone",
-        city: "City", college: "College", degree: "Degree",
-        branch: "Branch", graduation_year: "Graduation Year",
-        cgpa: "CGPA", skills: "Skills"
-    };
-
-    // Only read back fields that were actually filled
-    FIELD_IDS.forEach((id) => {
-        const inputEl = document.getElementById(id);
-        const val = (inputEl && inputEl.value) || (data && data[id]);
-        if (val && String(val).trim() !== "") {
-            const displayVal = Array.isArray(val) ? val.join(", ") : String(val).trim();
-            parts.push(`${labelMap[id]}: ${displayVal}`);
-        }
-    });
-
-    const summary = parts.length > 0
-        ? `I have filled in the following details. ${parts.join(". ")}. Please review the form and click Submit Application if everything looks correct. Or click Reset to start over.`
-        : "I could not extract any details. Please click the microphone and try again.";
-
-    speak(summary);
-
-    // Show review prompt in UI
-    showReviewPrompt();
+function handleFinalConfirm() {
+    endCall();
+    document.getElementById("modalOverlay").style.display = "flex";
+    hideReviewPrompt();
 }
 
-// ─── Step 4c: Handle missing fields ──────────────────────────────────────────
-function getMissingFields(data) {
-    return FIELD_IDS.filter((id) => {
-        const inputEl = document.getElementById(id);
-        const val = (inputEl && inputEl.value) || (data && data[id]);
-        return !val || (Array.isArray(val) ? val.length === 0 : String(val).trim() === "");
-    });
-}
-
-function handleMissingFields(missingIds) {
-    const labels = missingIds.map(fieldLabel).join(", ");
-    const msg = `Some fields are missing: ${labels}. Please say those details again.`;
-    const speech = `I did not hear your ${missingIds.slice(0, 3).map(fieldLabel).join(" and ")}. Please say ${missingIds.length === 1 ? "it" : "them"} again.`;
-
-    showMissing(msg);
-    setStatus("idle", `Missing: ${labels}`);
-    flowStarted = false;   // allow re-trigger on next mic click
-
-    speak(speech);
-}
-
-function fieldLabel(id) {
-    const labels = {
-        name: "Full Name", email: "Email", phone: "Phone Number",
-        city: "City", college: "College", degree: "Degree",
-        branch: "Branch", graduation_year: "Graduation Year",
-        cgpa: "CGPA", skills: "Skills"
-    };
-    return labels[id] || id;
-}
-
-// ─── Review prompt UI ─────────────────────────────────────────────────────────
 function showReviewPrompt() {
     const wrap = document.getElementById("reviewWrap");
     if (wrap) wrap.style.display = "block";
@@ -287,16 +281,13 @@ function hideReviewPrompt() {
     if (wrap) wrap.style.display = "none";
 }
 
-// ─── Language toggle ──────────────────────────────────────────────────────────
 function setLanguage(lang) {
     currentLang = lang;
     document.getElementById("btnEn").classList.toggle("active", lang === "en-IN");
     document.getElementById("btnHi").classList.toggle("active", lang === "hi-IN");
     setStatus("idle", `Language set to ${lang === "hi-IN" ? "Hindi" : "English"}`);
-    speak(lang === "hi-IN" ? "हिंदी भाषा चुनी गई है।" : "English language selected.");
 }
 
-// ─── Progress bar ─────────────────────────────────────────────────────────────
 function updateProgress() {
     const total = FIELD_IDS.length;
     const filled = FIELD_IDS.filter((id) => {
@@ -308,12 +299,8 @@ function updateProgress() {
     document.getElementById("progressLabel").textContent = `${filled} / ${total} fields filled`;
 }
 
-// ─── Reset ────────────────────────────────────────────────────────────────────
 function resetAll() {
-    stopRecording();
-    synth.cancel();
-    flowStarted = false;
-
+    endCall();
     FIELD_IDS.forEach((id) => {
         const input = document.getElementById(id);
         const ind = document.getElementById(`ind-${id}`);
@@ -321,54 +308,23 @@ function resetAll() {
         if (ind) ind.classList.remove("filled");
     });
 
-    setStatus("idle", "Click the mic to start");
+    setStatus("idle", "Click to start Live Agent");
     hideTranscript();
     hideMissing();
     hideReviewPrompt();
     showLoader(false);
     updateProgress();
-    document.getElementById("micBtn").classList.remove("recording");
-    document.getElementById("micLabel").textContent = "Start Voice Assistant";
-    document.getElementById("aiAvatar").classList.remove("listening");
 }
 
-// ─── Beep sound ───────────────────────────────────────────────────────────────
-function playBeep() {
-    try {
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.frequency.value = 880;
-        gain.gain.setValueAtTime(0.3, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.25);
-        osc.start(ctx.currentTime);
-        osc.stop(ctx.currentTime + 0.25);
-    } catch (_) { }
-}
-
-// ─── Form submit ──────────────────────────────────────────────────────────────
 document.getElementById("placementForm").addEventListener("submit", (e) => {
     e.preventDefault();
-    synth.cancel();
-
-    // Show success modal
-    document.getElementById("modalOverlay").style.display = "flex";
-
-    // Speak success
-    setTimeout(() => {
-        speak("Congratulations! Your placement application has been submitted successfully. We wish you all the best!");
-    }, 400);
-
-    hideReviewPrompt();
+    handleFinalConfirm();
 });
 
 function closeModal() {
     document.getElementById("modalOverlay").style.display = "none";
 }
 
-// ─── UI helpers ───────────────────────────────────────────────────────────────
 function setStatus(type, text) {
     const icon = document.getElementById("statusIcon");
     const txt = document.getElementById("statusText");
@@ -402,10 +358,9 @@ function hideMissing() {
     document.getElementById("missingWrap").style.display = "none";
 }
 
-// ─── Init ─────────────────────────────────────────────────────────────────────
 window.addEventListener("load", () => {
     updateProgress();
     setTimeout(() => {
-        setStatus("idle", "Click the mic to start");
+        setStatus("idle", "Click to start Live Agent");
     }, 500);
 });
