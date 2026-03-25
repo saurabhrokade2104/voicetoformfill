@@ -14,8 +14,14 @@ app.use(cors());
 app.use(express.json());
 
 // Serve static files from the frontend directory
-// This is needed for standard deployments like Railway
 app.use(express.static(path.join(__dirname, "../frontend")));
+
+// Parse Twilio's application/x-www-form-urlencoded webhooks
+app.use(express.urlencoded({ extended: true }));
+
+// Mount Twilio voice routes
+const twilioRoutes = require("./routes/twilio");
+app.use("/twilio", twilioRoutes);
 
 // Initialize Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
