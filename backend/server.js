@@ -7,6 +7,7 @@ const serverless = require("serverless-http");
 const http = require("http");
 const WebSocket = require("ws");
 const ConversationManager = require("./conversation");
+const { textToSpeech } = require("./services/tts");
 
 const app = express();
 
@@ -109,7 +110,23 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// Export the handler for serverless use (Netlify)
+// ─── /tts endpoint — Cartesia neural TTS ─────────────────────────────────────
+app.post("/tts", async (req, res) => {
+  const { text } = req.body;
+  if (!text || !text.trim()) {
+    return res.status(400).json({ error: "No text provided." });
+  }
+  try {
+    const audioBuffer = await textToSpeech(text.trim());
+    res.set("Content-Type", "audio/wav");
+    res.set("Cache-Control", "no-store");
+    res.send(audioBuffer);
+  } catch (err) {
+    console.error("[TTS] Cartesia error:", err.message || err);
+    res.status(500).json({ error: "TTS synthesis failed.", details: err.message });
+  }
+});
+
 module.exports.handler = serverless(app);
 
 // Standard listener for Railway and local development
