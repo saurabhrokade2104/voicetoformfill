@@ -13,6 +13,38 @@
         href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
         rel="stylesheet" />
     <link rel="stylesheet" href="style.css" />
+    <style>
+        .chat-bubble {
+            padding: 8px 12px;
+            border-radius: 12px;
+            font-size: 13px;
+            max-width: 90%;
+            word-wrap: break-word;
+            line-height: 1.4;
+        }
+
+        .chat-ai {
+            background: rgba(99, 102, 241, 0.2);
+            color: #c7d2fe;
+            align-self: flex-start;
+            border-bottom-left-radius: 4px;
+        }
+
+        .chat-user {
+            background: rgba(255, 255, 255, 0.08);
+            color: rgba(255, 255, 255, 0.8);
+            align-self: flex-end;
+            border-bottom-right-radius: 4px;
+        }
+
+        .chat-system {
+            background: rgba(251, 191, 36, 0.1);
+            color: #fbbf24;
+            align-self: center;
+            border-radius: 8px;
+            font-size: 12px;
+        }
+    </style>
 </head>
 
 <body>
@@ -79,10 +111,17 @@
                         <span class="status-text" id="statusText">Click the mic to start</span>
                     </div>
 
-                    <!-- Transcript area -->
+                    <!-- Chat log (conversation bubbles) -->
                     <div class="transcript-wrap" id="transcriptWrap" style="display:none">
                         <div class="transcript-label">I heard you say:</div>
                         <div class="transcript-text" id="transcriptText"></div>
+                    </div>
+                    <div id="chatLog"
+                        style="max-height:180px;overflow-y:auto;margin:10px 0;display:flex;flex-direction:column;gap:6px;">
+                    </div>
+                    <!-- Live interim STT text -->
+                    <div id="interimDisplay"
+                        style="display:none;font-size:13px;color:rgba(255,255,255,0.45);font-style:italic;padding:6px 10px;background:rgba(255,255,255,0.05);border-radius:8px;margin:6px 0;">
                     </div>
 
                     <!-- Language toggle -->

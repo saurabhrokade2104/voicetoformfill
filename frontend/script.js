@@ -1,13 +1,14 @@
 /* ─────────────────────────────────────────────────────────────────────────────
-   Voice Conversational Form Filler — script.js (Phase 1: WebSocket Real-Time)
+   Voice-to-Voice Form Filler — script.js
    FLOW:
-     1. User clicks "Start Voice Assistant".
-     2. Connects to backend WebSocket `/live`.
-     3. Backend natively says Hello via TTS.
-     4. Browser STT listens continuously & sends mapped text to Backend WS.
-     5. Backend LLM checks state & Cartesia streams back audio chunks.
-     6. Frontend plays chunks natively via AudioContext.
-     7. Form visually updates instantly via WS events.
+     1. User clicks "Start Voice Assistant"
+     2. WebSocket connects to /live
+     3. Backend sends {type: "speak", text: "..."}
+     4. Frontend speaks using browser SpeechSynthesis API -> mic is MUTED
+     5. Frontend finishes speaking -> sends {type: "speak_done"} to backend
+     6. Backend sends ready_for_input -> mic is UNMUTED, STT starts
+     7. Browser STT with interimResults + 1.5 s silence timer = natural pauses
+     8. Final/pause transcript sent to backend -> LLM -> loop repeats
 ───────────────────────────────────────────────────────────────────────────── */
 
 const WS_URL = `ws://${window.location.host}/live`;
@@ -15,173 +16,156 @@ const WS_URL = `ws://${window.location.host}/live`;
 // ─── State ────────────────────────────────────────────────────────────────────
 let recognition = null;
 let isCallActive = false;
+let micEnabled = false;        // true only when AI is NOT speaking
 let currentLang = "en-IN";
 let ws = null;
+let silenceTimer = null;       // pause-detection timer
+let interimBuffer = "";        // accumulates interim STT results
 
-// Audio context for playing Cartesia streaming audio
-let audioCtx = null;
-let nextPlayTime = 0;
+const PAUSE_TIMEOUT_MS = 1500;  // 1.5 s of silence → send accumulated text
 
 const FIELD_IDS = [
     "name", "email", "phone", "city",
     "college", "degree", "branch", "graduation_year", "cgpa", "skills"
 ];
 
-// ─── Audio Playback via AudioContext ─────────────────────────────────────────
+// ─── Browser Speech Synthesis (TTS) ───────────────────────────────────────────
 
-function initAudioContext() {
-    if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+function speakText(text) {
+    if (!text) return;
+
+    // Cancel any ongoing speech
+    window.speechSynthesis.cancel();
+
+    const utterance = new SpeechSynthesisUtterance(text);
+
+    // Try to find a good English voice
+    const voices = window.speechSynthesis.getVoices();
+    const preferredVoice = voices.find(v => v.lang.includes("en-US") || v.lang.includes("en-GB") || v.lang.includes("en-IN"));
+    if (preferredVoice) {
+        utterance.voice = preferredVoice;
     }
-    if (audioCtx.state === 'suspended') {
-        audioCtx.resume();
-    }
-}
 
-function playAudioChunk(base64Str) {
-    if (!audioCtx) return;
+    utterance.rate = 1.0;
+    utterance.pitch = 1.0;
 
-    try {
-        const binaryString = window.atob(base64Str);
-        const len = binaryString.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
+    utterance.onstart = () => {
+        setAvatarSpeaking(true);
+    };
+
+    utterance.onend = () => {
+        setAvatarSpeaking(false);
+        // Tell backend we finished speaking so it can unmute us
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "speak_done" }));
         }
+    };
 
-        // Ensure we only process even number of bytes for Int16
-        const alignedLength = len - (len % 2);
-        const int16 = new Int16Array(bytes.buffer, 0, alignedLength / 2);
-        const float32 = new Float32Array(int16.length);
-
-        for (let i = 0; i < int16.length; i++) {
-            float32[i] = int16[i] / 32768.0;
+    utterance.onerror = (e) => {
+        console.error("SpeechSynthesis error:", e);
+        setAvatarSpeaking(false);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "speak_done" })); // fallback
         }
+    };
 
-        const buffer = audioCtx.createBuffer(1, float32.length, 16000);
-        buffer.getChannelData(0).set(float32);
-
-        const source = audioCtx.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioCtx.destination);
-
-        const currentTime = audioCtx.currentTime;
-        if (nextPlayTime < currentTime) {
-            nextPlayTime = currentTime + 0.1; // 100ms buffer to handle network jitter
-        }
-
-        source.start(nextPlayTime);
-        nextPlayTime += buffer.duration;
-
-        // Visual feedback
-        document.getElementById("aiAvatar").classList.add("speaking");
-        source.onended = () => {
-            // Only remove if this was the last chunk
-            if (audioCtx && audioCtx.currentTime >= nextPlayTime - 0.1) {
-                document.getElementById("aiAvatar").classList.remove("speaking");
-            }
-        };
-
-    } catch (e) {
-        console.error("Audio playback error:", e);
-    }
+    window.speechSynthesis.speak(utterance);
 }
 
 function stopAudio() {
-    if (audioCtx) {
-        audioCtx.close();
-        audioCtx = null;
-    }
-    nextPlayTime = 0;
+    window.speechSynthesis.cancel();
 }
 
-
-// ─── Live Connection Management ──────────────────────────────────────────────
+// ─── Call Lifecycle ───────────────────────────────────────────────────────────
 
 function handleMicClick() {
-    if (isCallActive) {
-        endCall();
-    } else {
-        startCall();
-    }
+    isCallActive ? endCall() : startCall();
 }
 
 function startCall() {
-    initAudioContext();
     isCallActive = true;
-    hideMissing();
-    hideTranscript();
-    setStatus("processing", "Connecting to live voice agent...");
+    micEnabled = false;
+    hideMissing(); hideTranscript();
+    setStatus("processing", "Connecting to voice agent…");
     document.getElementById("micBtn").classList.add("recording");
     document.getElementById("micLabel").textContent = "End Call";
     showLoader(true);
 
+    // Ensure voices are loaded (Chrome quirk)
+    window.speechSynthesis.getVoices();
+
     ws = new WebSocket(WS_URL);
 
     ws.onopen = () => {
-        setStatus("listening", "Call Connected. Listening...");
+        setStatus("processing", "AI is preparing your greeting…");
         showLoader(false);
-        document.getElementById("aiAvatar").classList.add("listening");
-        startListening(); // Start browser STT
+        addChatBubble("system", "🔗 Connected. Wait for the AI to greet you…");
     };
 
     ws.onmessage = (event) => {
         try {
             const data = JSON.parse(event.data);
-            if (data.type === "form_update") {
+
+            if (data.type === "speak") {
+                // Backend wants us to speak this text natively
+                speakText(data.text);
+
+            } else if (data.type === "speaking_state") {
+                if (data.isSpeaking) {
+                    // AI is speaking — mute mic immediately
+                    micEnabled = false;
+                    pauseMicRecognition();
+                    setStatus("processing", "AI Speaking…");
+                    document.getElementById("aiAvatar").classList.add("speaking");
+                    document.getElementById("aiAvatar").classList.remove("listening");
+                } else {
+                    document.getElementById("aiAvatar").classList.remove("speaking");
+                }
+
+            } else if (data.type === "ready_for_input") {
+                // AI finished speaking — unmute mic
+                micEnabled = true;
+                setAvatarSpeaking(false);
+                setStatus("listening", "Your turn — speak now…");
+                document.getElementById("aiAvatar").classList.add("listening");
+                resumeMicRecognition();
+
+            } else if (data.type === "form_update") {
                 fillForm(data.data);
                 updateProgress();
                 if (data.isConfirmed) {
                     handleFinalConfirm();
                 } else if (data.textReply) {
-                    showTranscript("Agent: " + data.textReply);
+                    addChatBubble("ai", data.textReply);
                 }
-            } else if (data.type === "audio_chunk" && data.audioData) {
-                playAudioChunk(data.audioData);
-            } else if (data.type === "audio_end") {
-                // Done playing current turn
+
+            } else if (data.type === "error") {
+                addChatBubble("system", "⚠️ " + data.message);
             }
         } catch (e) {
-            console.error("WS error:", e);
+            console.error("WS parse error:", e);
         }
     };
 
-    ws.onclose = () => {
-        endCall();
-    };
-
-    ws.onerror = () => {
-        setStatus("idle", "Connection error. Retry.");
-        endCall();
-    };
+    ws.onclose = () => endCall();
+    ws.onerror = () => { setStatus("idle", "Connection error. Retry."); endCall(); };
 }
 
 function endCall() {
     isCallActive = false;
-    if (ws) {
-        ws.close();
-        ws = null;
-    }
-
-    if (recognition) {
-        try { recognition.stop(); } catch (e) { }
-    }
-
+    micEnabled = false;
+    clearSilenceTimer();
+    if (recognition) { try { recognition.stop(); } catch (e) { } recognition = null; }
+    if (ws) { ws.close(); ws = null; }
     stopAudio();
-
     document.getElementById("micBtn").classList.remove("recording");
     document.getElementById("micLabel").textContent = "Start Voice Assistant";
-    document.getElementById("aiAvatar").classList.remove("listening");
+    document.getElementById("aiAvatar").classList.remove("listening", "speaking");
     setStatus("idle", "Live call ended. Click to restart.");
     showLoader(false);
 }
 
-// ─── Step 2: Listen for user's speech ────────────────────────────────────────
-function startListening() {
-    recognition = initRecognition();
-    if (!recognition) return;
-    try { recognition.start(); } catch (e) { console.error("Recognition start error:", e); }
-}
+// ─── Speech Recognition with Pause Detection ─────────────────────────────────
 
 function initRecognition() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -190,44 +174,46 @@ function initRecognition() {
         return null;
     }
     const r = new SR();
-    // Continuous listening to mimic real-time call
     r.continuous = true;
-    r.interimResults = false; // Only send final text segments to LLM
+    r.interimResults = true;   // ← key: get partial results for pause detection
     r.lang = currentLang;
     r.maxAlternatives = 1;
 
     r.onresult = (e) => {
-        // Find the newly finalized text
-        for (let i = e.resultIndex; i < e.results.length; ++i) {
+        if (!micEnabled) return; // drop results while AI is talking
+
+        let interimText = "";
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+            const t = e.results[i][0].transcript;
             if (e.results[i].isFinal) {
-                const transcript = e.results[i][0].transcript.trim();
-                showTranscript("You: " + transcript);
-
-                // Stop any audio playing if user interrupts
-                if (audioCtx && audioCtx.state === 'running') {
-                    // Primitive interruption logic: skip queued audio
-                    // nextPlayTime = audioCtx.currentTime; 
-                }
-
-                // Send to backend via WS
-                if (ws && ws.readyState === WebSocket.OPEN && transcript.length > 0) {
-                    ws.send(JSON.stringify({ type: "text", text: transcript }));
-                    setStatus("processing", "AI Thinking...");
-                    setTimeout(() => setStatus("listening", "Call Active. Listening..."), 1500);
-                }
+                // Final result: clear interim, send immediately
+                clearSilenceTimer();
+                interimBuffer = "";
+                const finalText = t.trim();
+                if (finalText) sendUserSpeech(finalText);
+            } else {
+                interimText += t;
             }
+        }
+
+        if (interimText) {
+            // Update interim display
+            interimBuffer = interimText;
+            showInterim(interimText);
+            // Reset pause timer each time new speech arrives
+            resetSilenceTimer();
         }
     };
 
     r.onerror = (e) => {
-        // Ignore simple no-speech errors in continuous mode
-        if (e.error === 'no-speech') return;
-        console.error("Speech recognition error:", e.error);
+        if (e.error === "no-speech") return;
+        if (e.error === "aborted") return;   // triggered by our own stop() — normal
+        console.error("STT error:", e.error);
     };
 
     r.onend = () => {
-        // Auto-restart if we are still in call
-        if (isCallActive) {
+        // Auto-restart if call is still active AND mic is enabled
+        if (isCallActive && micEnabled) {
             try { r.start(); } catch (e) { }
         }
     };
@@ -235,7 +221,81 @@ function initRecognition() {
     return r;
 }
 
-// ─── UI Helpers ───────────────────────────────────────────────────────────
+function resumeMicRecognition() {
+    if (!recognition) {
+        recognition = initRecognition();
+    }
+    if (recognition && micEnabled) {
+        try { recognition.start(); } catch (e) { /* already running */ }
+    }
+}
+
+function pauseMicRecognition() {
+    clearSilenceTimer();
+    // Flush any interim text before muting
+    if (interimBuffer.trim()) {
+        sendUserSpeech(interimBuffer.trim());
+        interimBuffer = "";
+    }
+    if (recognition) {
+        try { recognition.stop(); } catch (e) { }
+    }
+    hideInterim();
+}
+
+function resetSilenceTimer() {
+    clearSilenceTimer();
+    silenceTimer = setTimeout(() => {
+        // Pause detected — send accumulated interim text
+        const text = interimBuffer.trim();
+        interimBuffer = "";
+        hideInterim();
+        if (text && micEnabled) {
+            sendUserSpeech(text);
+        }
+    }, PAUSE_TIMEOUT_MS);
+}
+
+function clearSilenceTimer() {
+    if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+}
+
+function sendUserSpeech(text) {
+    if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+    addChatBubble("user", text);
+    setStatus("processing", "AI Thinking…");
+    ws.send(JSON.stringify({ type: "text", text }));
+}
+
+// ─── UI Helpers ───────────────────────────────────────────────────────────────
+
+function setAvatarSpeaking(val) {
+    const av = document.getElementById("aiAvatar");
+    if (!av) return;
+    val ? av.classList.add("speaking") : av.classList.remove("speaking");
+}
+
+function addChatBubble(role, text) {
+    const wrap = document.getElementById("chatLog");
+    if (!wrap) { showTranscript(text); return; }
+    const div = document.createElement("div");
+    div.className = `chat-bubble chat-${role}`;
+    div.textContent = text;
+    wrap.appendChild(div);
+    wrap.scrollTop = wrap.scrollHeight;
+}
+
+function showInterim(text) {
+    let el = document.getElementById("interimDisplay");
+    if (!el) return;
+    el.textContent = text;
+    el.style.display = "block";
+}
+
+function hideInterim() {
+    const el = document.getElementById("interimDisplay");
+    if (el) { el.textContent = ""; el.style.display = "none"; }
+}
 
 function fillForm(data) {
     if (!data) return;
@@ -243,10 +303,8 @@ function fillForm(data) {
         const input = document.getElementById(fieldId);
         const indEl = document.getElementById(`ind-${fieldId}`);
         if (!input) return;
-
         let value = data[fieldId];
         if (Array.isArray(value)) value = value.join(", ");
-
         if (value && String(value).trim() !== "") {
             if (input.value !== String(value).trim()) {
                 input.value = String(value).trim();
@@ -261,23 +319,18 @@ function fillForm(data) {
 function handleFinalConfirm() {
     endCall();
     document.getElementById("modalOverlay").style.display = "flex";
-    hideReviewPrompt();
-}
-
-function showReviewPrompt() {
-    const wrap = document.getElementById("reviewWrap");
-    if (wrap) wrap.style.display = "block";
-}
-function hideReviewPrompt() {
-    const wrap = document.getElementById("reviewWrap");
-    if (wrap) wrap.style.display = "none";
 }
 
 function setLanguage(lang) {
     currentLang = lang;
     document.getElementById("btnEn").classList.toggle("active", lang === "en-IN");
     document.getElementById("btnHi").classList.toggle("active", lang === "hi-IN");
-    setStatus("idle", `Language set to ${lang === "hi-IN" ? "Hindi" : "English"}`);
+    setStatus("idle", `Language: ${lang === "hi-IN" ? "Hindi" : "English"}`);
+    // Restart recognition with new language if active
+    if (recognition) {
+        try { recognition.stop(); } catch (e) { }
+        recognition = null;
+    }
 }
 
 function updateProgress() {
@@ -299,22 +352,12 @@ function resetAll() {
         if (input) { input.value = ""; input.classList.remove("filled", "voice-filled"); }
         if (ind) ind.classList.remove("filled");
     });
-
+    const chatLog = document.getElementById("chatLog");
+    if (chatLog) chatLog.innerHTML = "";
     setStatus("idle", "Click to start Live Agent");
-    hideTranscript();
-    hideMissing();
-    hideReviewPrompt();
+    hideMissing(); hideTranscript();
     showLoader(false);
     updateProgress();
-}
-
-document.getElementById("placementForm").addEventListener("submit", (e) => {
-    e.preventDefault();
-    handleFinalConfirm();
-});
-
-function closeModal() {
-    document.getElementById("modalOverlay").style.display = "none";
 }
 
 function setStatus(type, text) {
@@ -336,8 +379,8 @@ function showTranscript(text) {
     document.getElementById("transcriptWrap").style.display = "block";
 }
 function hideTranscript() {
-    document.getElementById("transcriptWrap").style.display = "none";
-    document.getElementById("transcriptText").textContent = "";
+    const w = document.getElementById("transcriptWrap");
+    if (w) { w.style.display = "none"; const t = document.getElementById("transcriptText"); if (t) t.textContent = ""; }
 }
 function showLoader(show) {
     document.getElementById("loaderWrap").style.display = show ? "block" : "none";
@@ -349,10 +392,16 @@ function showMissing(text) {
 function hideMissing() {
     document.getElementById("missingWrap").style.display = "none";
 }
+function closeModal() {
+    document.getElementById("modalOverlay").style.display = "none";
+}
+
+document.getElementById("placementForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    handleFinalConfirm();
+});
 
 window.addEventListener("load", () => {
     updateProgress();
-    setTimeout(() => {
-        setStatus("idle", "Click to start Live Agent");
-    }, 500);
+    setTimeout(() => setStatus("idle", "Click to start Live Agent"), 500);
 });

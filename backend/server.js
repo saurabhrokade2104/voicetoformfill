@@ -1,4 +1,4 @@
-require("dotenv").config();
+require("dotenv").config({ path: require("path").join(__dirname, ".env") });
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
@@ -19,7 +19,7 @@ app.use(express.static(path.join(__dirname, "../frontend")));
 
 // Initialize Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
 // ─── /extract endpoint ────────────────────────────────────────────────────────
 app.post("/extract", async (req, res) => {
@@ -119,14 +119,17 @@ if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
     console.log("🎙️ New Live Call connection established.");
     const manager = new ConversationManager(ws);
 
-    // Trigger initial greeting natively
-    manager.handleUserSpeech("Hello, I'd like to fill out the placement form.");
+    // AI speaks first — no user input needed
+    manager.startConversation();
 
     ws.on("message", async (msg) => {
       try {
         const payload = JSON.parse(msg);
         if (payload.type === "text") {
           await manager.handleUserSpeech(payload.text);
+        } else if (payload.type === "speak_done") {
+          // Frontend finished speaking TTS — unmute mic
+          manager.onSpeakDone();
         }
       } catch (err) {
         console.error("Message error:", err);
