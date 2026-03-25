@@ -238,6 +238,24 @@ body {
   }
 }
 
+.ai-avatar.speaking {
+  animation: avatar-speaking 0.4s ease-in-out infinite;
+}
+
+@keyframes avatar-speaking {
+
+  0%,
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 30px var(--accent);
+  }
+
+  50% {
+    transform: scale(1.1);
+    box-shadow: 0 0 60px var(--accent-3);
+  }
+}
+
 .ai-avatar-ring {
   position: absolute;
   border-radius: 50%;
@@ -469,14 +487,6 @@ body {
   background: linear-gradient(135deg, var(--red), #dc2626);
   box-shadow: 0 8px 24px rgba(239, 68, 68, 0.4);
   animation: btn-pulse 1s ease-in-out infinite;
-}
-
-.mic-btn.ai-talking {
-  background: #334155;
-  box-shadow: none;
-  animation: none;
-  cursor: not-allowed;
-  opacity: 0.8;
 }
 
 @keyframes btn-pulse {

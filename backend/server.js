@@ -110,132 +110,38 @@ module.exports.handler = serverless(app);
 // We check if we are NOT running in a serverless environment
 if (!process.env.NETLIFY && !process.env.LAMBDA_TASK_ROOT) {
   const PORT = process.env.PORT || 3000;
-
-  app.use(express.urlencoded({ extended: true })); // Important for Twilio POST
-
-  // ─── Twilio Phase 2: Inbound Call Handler ───
-  app.post("/incoming-call", (req, res) => {
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-    <Response>
-        <Say voice="Polly.Joey">Connecting you to the AI placement assistant. Please wait.</Say>
-        <Connect>
-            <Stream url="wss://${req.headers.host}/twilio-media" />
-        </Connect>
-    </Response>`;
-    res.type("text/xml");
-    res.send(twiml);
-  });
-
-  // ─── WebSocket Server Setup ───
   const server = http.createServer(app);
-  const wss = new WebSocket.Server({ noServer: true });
 
-  server.on("upgrade", (request, socket, head) => {
-    const url = new URL(request.url, `http://${request.headers.host}`);
-    const pathname = url.pathname;
+  // Initialize WebSocket server for real-time live calling
+  const wss = new WebSocket.Server({ server, path: "/live" });
 
-    if (pathname === "/live" || pathname === "/twilio-media") {
-      wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit("connection", ws, request);
-      });
-    } else {
-      socket.destroy();
-    }
-  });
+  wss.on("connection", (ws) => {
+    console.log("🎙️ New Live Call connection established.");
+    const manager = new ConversationManager(ws);
 
-  wss.on("connection", (ws, req) => {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const pathname = url.pathname;
+    // Trigger initial greeting natively
+    manager.handleUserSpeech("Hello, I'd like to fill out the placement form.");
 
-    if (pathname === "/twilio-media") {
-      console.log("🎙️ Twilio Media Stream connected.");
-      handleTwilioStream(ws);
-    } else {
-      console.log("🎙️ New Browser Live Connection.");
-      const conversation = new ConversationManager(ws, "browser");
-      ws.on("message", async (message) => {
-        try {
-          const data = JSON.parse(message);
-          if (data.type === "text") {
-            await conversation.handleUserSpeech(data.text);
-          }
-        } catch (e) {
-          console.error("WS message error:", e);
-        }
-      });
-    }
-
-    ws.on("close", () => console.log("📵 Connection closed."));
-  });
-
-  // ─── Phase 2: Twilio Media Stream & Deepgram Bridge ───
-  async function handleTwilioStream(ws) {
-    const { createClient } = require("@deepgram/sdk");
-    const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
-
-    // 1. Initialize Conversation Manager for Twilio
-    const conversation = new ConversationManager(ws, "twilio");
-
-    // 2. Setup Deepgram live transcription
-    let dgConnection = deepgram.listen.live({
-      model: "nova-2",
-      language: "en-US",
-      smart_format: true,
-      encoding: "mulaw",
-      sample_rate: 8000,
-      interim_results: false,
-      no_delay: true,
-    });
-
-    // Link them so manager can update deepgram language if needed
-    conversation.setDeepgram(dgConnection, deepgram);
-
-    dgConnection.on("open", () => {
-      console.log("☁️ Deepgram STT connected.");
-    });
-
-    dgConnection.on("Transcript", async (data) => {
-      const transcript = data.channel.alternatives[0].transcript;
-      if (transcript && data.is_final) {
-        console.log("Twilio User Speech:", transcript);
-        await conversation.handleUserSpeech(transcript);
-      }
-    });
-
-    dgConnection.on("error", (err) => console.error("Deepgram Error:", err));
-
-    let streamSid = null;
-
-    ws.on("message", (message) => {
+    ws.on("message", async (msg) => {
       try {
-        const msg = JSON.parse(message);
-        if (msg.event === "start") {
-          streamSid = msg.start.streamSid;
-          conversation.setTwilioStream(streamSid);
-          console.log("Twilio Stream SID:", streamSid);
-          // Trigger first greeting after SID is known
-          conversation.handleUserSpeech("hello");
-        } else if (msg.event === "media") {
-          // Forward raw mu-law audio to Deepgram
-          const audioBuffer = Buffer.from(msg.media.payload, "base64");
-          dgConnection.send(audioBuffer);
+        const payload = JSON.parse(msg);
+        if (payload.type === "text") {
+          await manager.handleUserSpeech(payload.text);
         }
-      } catch (e) {
-        // ignore
+      } catch (err) {
+        console.error("Message error:", err);
       }
     });
 
     ws.on("close", () => {
-      dgConnection.finish();
+      console.log("📵 Live Call connection closed.");
     });
-  }
+  });
 
   server.listen(PORT, () => {
     console.log(`\n🚀 Voice Form AI Server running at http://localhost:${PORT}`);
     console.log(`📋 POST /extract  — Speech → LLM → JSON form data`);
-    console.log(`📞 POST /incoming-call — Twilio webhook for inbound calls`);
-    console.log(`🔌 WS   /live     — Live real-time audio pipeline (Browser)`);
-    console.log(`🔌 WS   /twilio-media — Live real-time audio pipeline (Twilio)`);
+    console.log(`🔌 WS   /live     — Live real-time audio pipeline`);
     console.log(`💚 GET  /health   — Server health check\n`);
   });
 }

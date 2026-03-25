@@ -17,7 +17,6 @@ let recognition = null;
 let isCallActive = false;
 let currentLang = "en-IN";
 let ws = null;
-let isAiSpeaking = false;
 
 // Audio context for playing Cartesia streaming audio
 let audioCtx = null;
@@ -42,33 +41,50 @@ function initAudioContext() {
 function playAudioChunk(base64Str) {
     if (!audioCtx) return;
 
-    // Cartesia sends raw pcm_s16le encoded as base64 in our setup
-    const rawStr = window.atob(base64Str);
-    const len = rawStr.length;
-    const bytes = new Int16Array(len / 2);
-    for (let i = 0; i < len; i += 2) {
-        bytes[i / 2] = rawStr.charCodeAt(i) | (rawStr.charCodeAt(i + 1) << 8);
-        if (bytes[i / 2] > 32767) bytes[i / 2] -= 65536;
+    try {
+        const binaryString = window.atob(base64Str);
+        const len = binaryString.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
+
+        // Ensure we only process even number of bytes for Int16
+        const alignedLength = len - (len % 2);
+        const int16 = new Int16Array(bytes.buffer, 0, alignedLength / 2);
+        const float32 = new Float32Array(int16.length);
+
+        for (let i = 0; i < int16.length; i++) {
+            float32[i] = int16[i] / 32768.0;
+        }
+
+        const buffer = audioCtx.createBuffer(1, float32.length, 16000);
+        buffer.getChannelData(0).set(float32);
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioCtx.destination);
+
+        const currentTime = audioCtx.currentTime;
+        if (nextPlayTime < currentTime) {
+            nextPlayTime = currentTime + 0.1; // 100ms buffer to handle network jitter
+        }
+
+        source.start(nextPlayTime);
+        nextPlayTime += buffer.duration;
+
+        // Visual feedback
+        document.getElementById("aiAvatar").classList.add("speaking");
+        source.onended = () => {
+            // Only remove if this was the last chunk
+            if (audioCtx && audioCtx.currentTime >= nextPlayTime - 0.1) {
+                document.getElementById("aiAvatar").classList.remove("speaking");
+            }
+        };
+
+    } catch (e) {
+        console.error("Audio playback error:", e);
     }
-
-    const buffer = audioCtx.createBuffer(1, bytes.length, 16000);
-    const channelData = buffer.getChannelData(0);
-    for (let i = 0; i < bytes.length; i++) {
-        channelData[i] = bytes[i] / 32768.0;
-    }
-
-    const source = audioCtx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(audioCtx.destination);
-
-    if (nextPlayTime < audioCtx.currentTime) {
-        nextPlayTime = audioCtx.currentTime;
-    }
-    source.start(nextPlayTime);
-    nextPlayTime += buffer.duration;
-
-    // Mark AI speaking until the last buffer finishes (+ small buffer)
-    isAiSpeaking = true;
 }
 
 function stopAudio() {
@@ -121,23 +137,9 @@ function startCall() {
                     showTranscript("Agent: " + data.textReply);
                 }
             } else if (data.type === "audio_chunk" && data.audioData) {
-                isAiSpeaking = true;
-                setStatus("processing", "AI Speaking...");
-                document.getElementById("micBtn").classList.add("ai-talking");
-                document.getElementById("micLabel").textContent = "AI Speaking...";
-                document.getElementById("aiAvatar").classList.remove("listening");
                 playAudioChunk(data.audioData);
             } else if (data.type === "audio_end") {
-                // Wait slightly after audio ends before unmuting mic to avoid tail echo
-                setTimeout(() => {
-                    isAiSpeaking = false;
-                    if (isCallActive) {
-                        setStatus("listening", "Call Active. Listening...");
-                        document.getElementById("micBtn").classList.remove("ai-talking");
-                        document.getElementById("micLabel").textContent = "End Call";
-                        document.getElementById("aiAvatar").classList.add("listening");
-                    }
-                }, 1000);
+                // Done playing current turn
             }
         } catch (e) {
             console.error("WS error:", e);
@@ -199,16 +201,6 @@ function initRecognition() {
         for (let i = e.resultIndex; i < e.results.length; ++i) {
             if (e.results[i].isFinal) {
                 const transcript = e.results[i][0].transcript.trim();
-
-                // COMPREHENSIVE ECHO CANCELLATION:
-                // If flag is set OR the audio queue hasn't finished playing yet, ignore.
-                const isPlaybackHappening = (audioCtx && audioCtx.currentTime < nextPlayTime + 0.5);
-
-                if (isAiSpeaking || isPlaybackHappening) {
-                    console.log("🚫 Echo ignored:", transcript);
-                    return;
-                }
-
                 showTranscript("You: " + transcript);
 
                 // Stop any audio playing if user interrupts

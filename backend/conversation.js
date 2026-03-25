@@ -15,61 +15,21 @@ const REQUIRED_FIELDS = [
 ];
 
 class ConversationManager {
-    constructor(ws, mode = "browser") {
+    constructor(ws) {
         this.ws = ws;
-        this.mode = mode; // "browser" or "twilio"
-        this.streamSid = null;
-        this.language = "en-US";
-        this.hasSelectedLanguage = false;
-        this.dgConnection = null;
-        this.dgClient = null;
-
         this.state = REQUIRED_FIELDS.reduce((acc, field) => {
             acc[field] = "";
             return acc;
         }, {});
 
+        // We can hold previous dialogue in history for better LLM context
         this.history = [];
         this.accumulatedText = "";
         this.llmTimeout = null;
     }
 
-    setTwilioStream(streamSid) {
-        this.streamSid = streamSid;
-    }
-
-    setDeepgram(dgConnection, dgClient) {
-        this.dgConnection = dgConnection;
-        this.dgClient = dgClient;
-    }
-
     async handleUserSpeech(text) {
         if (!text || text.trim() === "") return;
-        console.log(`📥 Received [${this.mode}] speech: ${text}`);
-
-        // Language selection logic for Twilio
-        if (this.mode === "twilio" && !this.hasSelectedLanguage) {
-            const lowerText = text.toLowerCase();
-            if (lowerText.includes("hindi") || lowerText.includes("hi")) {
-                this.language = "hi-IN";
-                this.hasSelectedLanguage = true;
-                await this.streamAudio("नमस्ते! ठीक है, हम हिंदी में जारी रखेंगे। कृपया अपना पूरा नाम बताएं।");
-                return;
-            } else if (lowerText.includes("english") || lowerText.includes("hello")) {
-                this.language = "en-US";
-                this.hasSelectedLanguage = true;
-                if (lowerText === "hello") {
-                    await this.streamAudio("Hello! Which language would you prefer: English or Hindi?");
-                    this.hasSelectedLanguage = false;
-                    return;
-                }
-                await this.streamAudio("Perfect, let's continue in English. Please tell me your full name.");
-                return;
-            } else {
-                await this.streamAudio("Welcome. Please say English or Hindi to continue.");
-                return;
-            }
-        }
 
         this.accumulatedText += text + " ";
         if (this.llmTimeout) clearTimeout(this.llmTimeout);
@@ -81,27 +41,43 @@ class ConversationManager {
         this.accumulatedText = "";
         if (!textToProcess) return;
 
-        console.log(`🧠 [${this.mode}] Processing with Gemini:`, textToProcess);
         this.history.push({ role: "user", content: textToProcess });
 
-        const systemPrompt = `You are a professional, realistic human voice assistant helping a user fill out a placement registration form.
-The current language is ${this.language === "hi-IN" ? "Hindi" : "English"}. You MUST respond ONLY in this language.
-Your goal is to be extremely helpful and natural over the phone.
+        const missingFields = REQUIRED_FIELDS.filter(f => !this.state[f] || (Array.isArray(this.state[f]) && this.state[f].length === 0));
 
-Current Form (some fields may be filled):
+        const systemPrompt = `You are a helpful and polite voice assistant helping a user fill out a placement registration form.
+You are currently on a live call with the user.
+
+Your goal is to extract the following fields from what the user just said:
+${REQUIRED_FIELDS.join(", ")}
+
+Here is the current state of the form (some fields might be filled already):
 ${JSON.stringify(this.state, null, 2)}
 
-STRICT RULES:
-1. Extract any new info from the latest user input.
-2. If most fields are filled, ask for the remaining ones.
-3. ONCE ALL FIELDS ARE FILLED: Summarize EVERYTHING and ask: "I have all your details. Would you like to confirm and submit?"
-4. IF THE USER SAYS YES/CONFIRM/SUBMIT to that final prompt, YOU MUST SET "isConfirmed" to true and say "Thank you! I have submitted your form. Goodbye!"
+Instructions:
+1. Examine the User's latest input. Extract any details that match the required fields.
+2. Update the form state accordingly.
+3. Look at what fields are STILL MISSING.
+4. Formulate a short, conversational response asking the user for 1 or 2 of the missing fields. Do not ask for everything at once. Keep it natural like a phone call.
+5. If ALL fields are filled, your reply text should be: "Great! I have all your details. Please say 'confirm' to submit the form."
+6. If the user says something like "confirm", "submit", or "yes", and all details are filled, set "isConfirmed" to true.
 
-Response format (JSON only):
+You MUST respond strictly with a valid JSON object matching this schema:
 {
-  "updatedState": { ... },
-  "replyText": "Conversational reply as a human assistant.",
-  "isConfirmed": boolean
+  "updatedState": {
+    "name": "...",
+    "email": "...",
+    "phone": "...",
+    "city": "...",
+    "college": "...",
+    "degree": "...",
+    "branch": "...",
+    "graduation_year": "...",
+    "cgpa": "...",
+    "skills": ["..."]
+  },
+  "replyText": "The conversational reply to the user, spoken out loud.",
+  "isConfirmed": false
 }`;
 
         const promptText = `${systemPrompt}\n\nRecent History:\n${this.history.slice(-3).map(h => h.role + ": " + h.content).join("\n")}`;
@@ -113,8 +89,6 @@ Response format (JSON only):
             const jsonStr = rawContent.replace(/```json?\n?/gi, "").replace(/```/gi, "").trim();
             const llmResponse = JSON.parse(jsonStr);
 
-            console.log("🤖 LLM Decision:", JSON.stringify(llmResponse, null, 2));
-
             // Update local state
             this.state = { ...this.state, ...llmResponse.updatedState };
             this.history.push({ role: "assistant", content: llmResponse.replyText });
@@ -124,7 +98,7 @@ Response format (JSON only):
                 type: "form_update",
                 data: this.state,
                 textReply: llmResponse.replyText,
-                isConfirmed: llmResponse.isConfirmed === true
+                isConfirmed: llmResponse.isConfirmed
             }));
 
             // 2. Stream audio response via Cartesia to frontend
@@ -151,72 +125,39 @@ Response format (JSON only):
             return;
         }
 
+        console.log(`🔊 Streaming TTS for: "${text.substring(0, 30)}..."`);
+
         try {
-            const WebSocket = require("ws");
-            const cartesiaWs = new WebSocket(`wss://api.cartesia.ai/tts/websocket?api_key=${process.env.CARTESIA_API_KEY}&cartesia_version=2024-06-10`);
-
-            cartesiaWs.on("open", () => {
-                const request = {
-                    context_id: "ctx_" + Date.now(),
-                    model_id: "sonic-english",
-                    transcript: text,
-                    voice: { mode: "id", id: "51475510-6bc3-48b7-a37a-e37456d2cf93" }, // High-quality, natural voice
-                    output_format: { container: "raw", encoding: "pcm_s16le", sample_rate: 16000 }
-                };
-                cartesiaWs.send(JSON.stringify(request));
+            const ttsWebsocket = cartesia.tts.websocket({
+                container: "raw",
+                encoding: "pcm_s16le",
+                sampleRate: 16000
             });
 
-            cartesiaWs.on("message", (data) => {
-                try {
-                    const msg = JSON.parse(data);
-                    if (msg.data && (msg.type === "chunk" || !msg.type)) {
-                        if (this.mode === "twilio") {
-                            // TRANSCODE: 16kHz PCM -> 8kHz Mu-law
-                            const { WaveFile } = require("wavefile");
-                            const wav = new WaveFile();
-                            const buffer = Buffer.from(msg.data, "base64");
+            const stream = await ttsWebsocket.send({
+                model_id: "sonic-english",
+                voice: {
+                    mode: "id",
+                    id: "a0e99841-438c-4a64-b679-ae501e7d6091", // Reverting to initial reliable voice id
+                },
+                transcript: text,
+            });
 
-                            // Load as 16-bit PCM, 16kHz, mono
-                            wav.fromScratch(1, 16000, '16', new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length / 2));
+            console.log("📡 TTS Stream started...");
+            let chunksSent = 0;
 
-                            // Resample to 8kHz
-                            wav.toSampleRate(8000);
-
-                            // Convert to mu-law
-                            wav.toMuLaw();
-
-                            // Send to Twilio
-                            this.ws.send(JSON.stringify({
-                                event: "media",
-                                streamSid: this.streamSid,
-                                media: {
-                                    payload: Buffer.from(wav.data.samples).toString("base64")
-                                }
-                            }));
-                        } else {
-                            // Browser mode
-                            this.ws.send(JSON.stringify({
-                                type: "audio_chunk",
-                                audioData: msg.data
-                            }));
-                        }
-                    } else if (msg.type === "done") {
-                        if (this.mode === "browser") {
-                            this.ws.send(JSON.stringify({ type: "audio_end" }));
-                        }
-                        cartesiaWs.close();
-                    } else if (msg.type === "error") {
-                        console.error("Cartesia API Error:", msg.error);
-                        cartesiaWs.close();
-                    }
-                } catch (e) {
-                    console.error("Cartesia parse error", e);
+            for await (const message of stream) {
+                if (message && message.data) {
+                    chunksSent++;
+                    this.ws.send(JSON.stringify({
+                        type: "audio_chunk",
+                        audioData: message.data // base64 string
+                    }));
                 }
-            });
+            }
 
-            cartesiaWs.on("error", (err) => {
-                console.error("Cartesia WS Error:", err);
-            });
+            console.log(`✅ TTS Stream finished. Sent ${chunksSent} chunks.`);
+            this.ws.send(JSON.stringify({ type: "audio_end" }));
 
         } catch (err) {
             console.error("Cartesia TTS Error:", err);
