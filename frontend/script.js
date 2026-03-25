@@ -11,7 +11,8 @@
      8. Final/pause transcript sent to backend -> LLM -> loop repeats
 ───────────────────────────────────────────────────────────────────────────── */
 
-const WS_URL = `ws://${window.location.host}/live`;
+const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+const WS_URL = `${wsProtocol}//${window.location.host}/live`;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 let recognition = null;
